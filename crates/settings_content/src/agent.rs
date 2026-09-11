@@ -271,6 +271,15 @@ pub struct AgentSettingsContent {
     pub default_profile: Option<Arc<str>>,
     /// The available agent profiles.
     pub profiles: Option<IndexMap<Arc<str>, AgentProfileContent>>,
+    /// Whether the agent usage dashboard may fetch LiteLLM's public model
+    /// price table over the network.
+    ///
+    /// With this off, costs come only from `model_pricing` and from prices a
+    /// provider reports for its own models; anything else is shown with token
+    /// counts and no cost.
+    ///
+    /// Default: true
+    pub fetch_model_prices: Option<bool>,
     /// Token prices used by the agent usage dashboard, keyed by model id
     /// (for example `claude-opus-5`).
     ///

@@ -11,16 +11,16 @@
 use std::collections::HashMap;
 
 use agent::ThreadUsageRow;
-use agent_settings::AgentSettings;
 use chrono::{Local, NaiveDate};
-use gpui::{App, EventEmitter, FocusHandle, Focusable, Task};
-use language_model::{LanguageModelCostInfo, LanguageModelRegistry, TokenUsage};
-use settings::{ModelPricing, Settings as _};
+use gpui::{App, EventEmitter, FocusHandle, Focusable, Subscription, Task};
+use language_model::TokenUsage;
+use settings::SettingsStore;
 use ui::{Table, prelude::*};
 use util::ResultExt as _;
 use workspace::{Item, Workspace};
 
 use crate::OpenUsageDashboard;
+use crate::model_rate_table::{self, Rate};
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -30,102 +30,6 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
-}
-
-/// What a model charges, in dollars per single token.
-///
-/// Kept as four separate rates because cached and uncached input are billed
-/// very differently; a single blended rate would misreport any agent that
-/// leans on prompt caching, which is most of them.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Rate {
-    input: f64,
-    output: f64,
-    cache_read: f64,
-    cache_write: f64,
-}
-
-const PER_MILLION: f64 = 1_000_000.0;
-
-impl Rate {
-    fn from_settings(pricing: &ModelPricing) -> Self {
-        let input = f64::from(pricing.input) / PER_MILLION;
-        Self {
-            input,
-            output: f64::from(pricing.output) / PER_MILLION,
-            // An unspecified cache rate bills cached tokens as plain input
-            // rather than as free, which is the safer direction to be wrong in.
-            cache_read: pricing
-                .cache_read
-                .map_or(input, |rate| f64::from(rate) / PER_MILLION),
-            cache_write: pricing
-                .cache_write
-                .map_or(input, |rate| f64::from(rate) / PER_MILLION),
-        }
-    }
-
-    /// Providers report one input and one output rate, so cache reads are
-    /// priced as full input here. That overstates cost wherever cache reads
-    /// are discounted; a `model_pricing` entry corrects it.
-    fn from_provider(info: &LanguageModelCostInfo) -> Option<Self> {
-        match info {
-            LanguageModelCostInfo::TokenCost {
-                input_token_cost_per_1m,
-                output_token_cost_per_1m,
-            } => {
-                let input = input_token_cost_per_1m / PER_MILLION;
-                Some(Self {
-                    input,
-                    output: output_token_cost_per_1m / PER_MILLION,
-                    cache_read: input,
-                    cache_write: input,
-                })
-            }
-            // A per-request multiplier is not a dollar figure, and pretending
-            // otherwise would invent a number.
-            LanguageModelCostInfo::RequestCost { .. } => None,
-        }
-    }
-
-    /// `input_tokens` counts only tokens that were *not* served from cache:
-    /// every provider Zed talks to reports the three classes separately, so
-    /// the four terms below do not double count.
-    fn cost(&self, usage: &TokenUsage) -> f64 {
-        usage.input_tokens as f64 * self.input
-            + usage.output_tokens as f64 * self.output
-            + usage.cache_read_input_tokens as f64 * self.cache_read
-            + usage.cache_creation_input_tokens as f64 * self.cache_write
-    }
-
-    /// What the cache reads would have cost at the full input rate, less what
-    /// they did cost. Zero when the rate carries no cache discount.
-    fn cache_savings(&self, usage: &TokenUsage) -> f64 {
-        usage.cache_read_input_tokens as f64 * (self.input - self.cache_read)
-    }
-}
-
-/// Rates for every model we can price, keyed by model id.
-///
-/// Provider-reported rates are inserted first so a user's `model_pricing`
-/// entry always wins.
-fn rate_table(cx: &App) -> HashMap<String, Rate> {
-    let mut rates = HashMap::default();
-
-    for model in LanguageModelRegistry::read_global(cx).available_models(cx) {
-        if let Some(rate) = model
-            .model_cost_info()
-            .as_ref()
-            .and_then(Rate::from_provider)
-        {
-            rates.insert(model.id().0.to_string(), rate);
-        }
-    }
-
-    for (model_id, pricing) in &AgentSettings::get_global(cx).model_pricing {
-        rates.insert(model_id.to_string(), Rate::from_settings(pricing));
-    }
-
-    rates
 }
 
 /// Everything spent on one model over the selected range.
@@ -183,7 +87,7 @@ fn summarize(
 
         let provider_id = row.provider_id.as_deref().unwrap_or("unknown");
         let model_id = row.model_id.as_deref().unwrap_or("unknown");
-        let rate = rates.get(model_id);
+        let rate = model_rate_table::rate_for(rates, model_id);
 
         let entry = by_model
             .entry((provider_id, model_id))
@@ -198,7 +102,7 @@ fn summarize(
 
         entry.usage = entry.usage + row.usage;
         entry.threads += 1;
-        if let Some(rate) = rate {
+        if let Some(rate) = &rate {
             let cost = rate.cost(&row.usage);
             *entry.cost.get_or_insert(0.0) += cost;
             entry.cache_savings += rate.cache_savings(&row.usage);
@@ -262,24 +166,50 @@ pub struct UsageDashboard {
     /// All of history, loaded once. Ranges are sliced from this.
     rows: Vec<ThreadUsageRow>,
     range: Range,
+    /// Recomputed only when the rows, the range, or the prices change.
+    ///
+    /// Resolving rates means merging the fetched price table, which has on the
+    /// order of a thousand entries; doing that per frame would make scrolling
+    /// the table cost more than loading it.
+    summary: Summary,
     loading: bool,
     _load: Task<()>,
+    _settings: Subscription,
 }
 
 impl UsageDashboard {
     fn new(cx: &mut Context<Self>) -> Self {
         let usage = agent::thread_usage(cx);
+        // Kicked off alongside the query so a first-run price fetch overlaps
+        // with reading history rather than following it.
+        let prices = model_rate_table::refresh(cx);
 
         Self {
             focus_handle: cx.focus_handle(),
             rows: Vec::new(),
             range: Range::Week,
+            summary: Summary::default(),
             loading: true,
+            _settings: cx.observe_global::<SettingsStore>(|this, cx| {
+                this.recompute(cx);
+                cx.notify();
+            }),
             _load: cx.spawn(async move |this, cx| {
                 let rows = usage.await.log_err().unwrap_or_default();
                 this.update(cx, |this, cx| {
                     this.rows = rows;
                     this.loading = false;
+                    this.recompute(cx);
+                    cx.notify();
+                })
+                .ok();
+
+                // Token counts are shown as soon as they are read. Prices may
+                // still be in flight on a first run, so fold them in when they
+                // land rather than making history wait on a network request.
+                prices.await;
+                this.update(cx, |this, cx| {
+                    this.recompute(cx);
                     cx.notify();
                 })
                 .ok();
@@ -287,9 +217,11 @@ impl UsageDashboard {
         }
     }
 
-    fn summary(&self, cx: &App) -> Summary {
+    /// Rebuilds the totals. Called when the rows, the range, or the prices
+    /// change — never from `render`.
+    fn recompute(&mut self, cx: &App) {
         let since = self.range.since(Local::now().date_naive());
-        summarize(&self.rows, since, &rate_table(cx))
+        self.summary = summarize(&self.rows, since, &model_rate_table::resolve(cx));
     }
 }
 
@@ -329,7 +261,7 @@ impl UsageDashboard {
 
 impl Render for UsageDashboard {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let summary = self.summary(cx);
+        let summary = &self.summary;
         let range = self.range;
 
         let mut table = Table::new(6).striped().header(vec![
@@ -389,6 +321,7 @@ impl Render for UsageDashboard {
                             .toggle_state(option == range)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.range = option;
+                                this.recompute(cx);
                                 cx.notify();
                             }))
                     }))),
@@ -471,10 +404,10 @@ mod tests {
 
     fn rate() -> Rate {
         Rate {
-            input: 3.0 / PER_MILLION,
-            output: 15.0 / PER_MILLION,
-            cache_read: 0.3 / PER_MILLION,
-            cache_write: 3.75 / PER_MILLION,
+            input: 3.0 / 1_000_000.0,
+            output: 15.0 / 1_000_000.0,
+            cache_read: 0.3 / 1_000_000.0,
+            cache_write: 3.75 / 1_000_000.0,
         }
     }
 
@@ -497,47 +430,11 @@ mod tests {
     }
 
     #[test]
-    fn prices_each_token_class_at_its_own_rate() {
-        // 1M uncached in, 1M out, 1M cache read, 1M cache write.
-        let cost = rate().cost(&usage(1_000_000, 1_000_000, 1_000_000, 1_000_000));
-        assert!((cost - (3.0 + 15.0 + 0.3 + 3.75)).abs() < 1e-9);
-    }
-
-    #[test]
-    fn cache_savings_measure_the_discount_not_the_spend() {
-        let savings = rate().cache_savings(&usage(0, 0, 1_000_000, 0));
-        assert!((savings - 2.7).abs() < 1e-9);
-    }
-
-    #[test]
-    fn settings_rates_default_cache_to_the_input_rate() {
-        let pricing = ModelPricing {
-            input: 2.0,
-            output: 8.0,
-            cache_read: None,
-            cache_write: None,
-        };
-        let rate = Rate::from_settings(&pricing);
-        assert_eq!(rate.cache_read, rate.input);
-        assert_eq!(rate.cache_write, rate.input);
-    }
-
-    #[test]
-    fn a_request_multiplier_is_not_a_price() {
-        assert_eq!(
-            Rate::from_provider(&LanguageModelCostInfo::RequestCost {
-                cost_per_request: 1.0
-            }),
-            None
-        );
-    }
-
-    #[test]
     fn groups_by_model_and_sums_usage() {
-        let rates = HashMap::from_iter([("opus".to_string(), rate())]);
+        let rates = HashMap::from_iter([("claude-opus-5".to_string(), rate())]);
         let rows = vec![
-            row("opus", 0, usage(100, 10, 0, 0)),
-            row("opus", 0, usage(200, 20, 0, 0)),
+            row("claude-opus-5", 0, usage(100, 10, 0, 0)),
+            row("claude-opus-5", 0, usage(200, 20, 0, 0)),
         ];
 
         let summary = summarize(&rows, None, &rates);
@@ -549,10 +446,10 @@ mod tests {
 
     #[test]
     fn excludes_threads_older_than_the_range() {
-        let rates = HashMap::from_iter([("opus".to_string(), rate())]);
+        let rates = HashMap::from_iter([("claude-opus-5".to_string(), rate())]);
         let rows = vec![
-            row("opus", 0, usage(100, 0, 0, 0)),
-            row("opus", 40, usage(900, 0, 0, 0)),
+            row("claude-opus-5", 0, usage(100, 0, 0, 0)),
+            row("claude-opus-5", 40, usage(900, 0, 0, 0)),
         ];
 
         let since = Range::Month.since(Local::now().date_naive());
@@ -574,13 +471,13 @@ mod tests {
 
     #[test]
     fn priced_models_sort_above_unpriced_ones() {
-        let rates = HashMap::from_iter([("opus".to_string(), rate())]);
+        let rates = HashMap::from_iter([("claude-opus-5".to_string(), rate())]);
         let rows = vec![
             row("mystery-model", 0, usage(10_000_000, 0, 0, 0)),
-            row("opus", 0, usage(1_000, 0, 0, 0)),
+            row("claude-opus-5", 0, usage(1_000, 0, 0, 0)),
         ];
 
         let summary = summarize(&rows, None, &rates);
-        assert_eq!(summary.rows[0].model_id.as_ref(), "opus");
+        assert_eq!(summary.rows[0].model_id.as_ref(), "claude-opus-5");
     }
 }

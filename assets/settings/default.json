@@ -1135,6 +1135,22 @@
     "entry_primary_click_action": "project_diff",
   },
   "agent": {
+    // Whether the agent usage dashboard may fetch LiteLLM's public model price
+    // table over the network. With this off, costs come only from
+    // `model_pricing` and from prices a provider reports for its own models.
+    "fetch_model_prices": true,
+    // Token prices for the agent usage dashboard, keyed by model id, in dollars
+    // per million tokens. An entry here overrides every other price source.
+    //
+    // "model_pricing": {
+    //   "claude-sonnet-5": {
+    //     "input": 3,
+    //     "output": 15,
+    //     "cache_read": 0.3,
+    //     "cache_write": 3.75
+    //   }
+    // }
+    "model_pricing": {},
     // Whether the inline assistant should use streaming tools, when available
     "inline_assistant_use_streaming_tools": true,
     // Whether to include project rules files (AGENTS.md, CLAUDE.md, .rules, etc.)

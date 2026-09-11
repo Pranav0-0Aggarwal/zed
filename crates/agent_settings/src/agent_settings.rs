@@ -224,6 +224,8 @@ pub struct AgentSettings {
     pub favorite_models: Vec<LanguageModelSelection>,
     pub default_profile: AgentProfileId,
     pub profiles: IndexMap<AgentProfileId, AgentProfileSettings>,
+    /// Whether the usage dashboard may fetch the public model price table.
+    pub fetch_model_prices: bool,
     /// Token prices per model id, in dollars per million tokens. Empty unless
     /// the user configured it; a model with no entry and no provider-reported
     /// price is shown with its token counts and no cost.
@@ -788,6 +790,7 @@ impl Settings for AgentSettings {
             inline_alternatives: agent.inline_alternatives.unwrap_or_default(),
             favorite_models: agent.favorite_models,
             default_profile: AgentProfileId(agent.default_profile.unwrap()),
+            fetch_model_prices: agent.fetch_model_prices.unwrap_or(true),
             model_pricing: agent.model_pricing.unwrap_or_default(),
             profiles: agent
                 .profiles

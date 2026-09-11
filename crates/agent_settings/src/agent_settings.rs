@@ -17,9 +17,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
     DockPosition, DockSide, IntoGpui, LanguageModelParameters, LanguageModelSelection,
-    NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings, SettingsContent,
-    SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
-    update_settings_file, update_settings_file_with_completion,
+    ModelPricing, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings,
+    SettingsContent, SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay,
+    ToolPermissionMode, update_settings_file, update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 
@@ -224,6 +224,10 @@ pub struct AgentSettings {
     pub favorite_models: Vec<LanguageModelSelection>,
     pub default_profile: AgentProfileId,
     pub profiles: IndexMap<AgentProfileId, AgentProfileSettings>,
+    /// Token prices per model id, in dollars per million tokens. Empty unless
+    /// the user configured it; a model with no entry and no provider-reported
+    /// price is shown with its token counts and no cost.
+    pub model_pricing: IndexMap<Arc<str>, ModelPricing>,
 
     pub notify_when_agent_waiting: NotifyWhenAgentWaiting,
     pub play_sound_when_agent_done: PlaySoundWhenAgentDone,
@@ -784,6 +788,7 @@ impl Settings for AgentSettings {
             inline_alternatives: agent.inline_alternatives.unwrap_or_default(),
             favorite_models: agent.favorite_models,
             default_profile: AgentProfileId(agent.default_profile.unwrap()),
+            model_pricing: agent.model_pricing.unwrap_or_default(),
             profiles: agent
                 .profiles
                 .unwrap()

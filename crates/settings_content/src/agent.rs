@@ -271,6 +271,15 @@ pub struct AgentSettingsContent {
     pub default_profile: Option<Arc<str>>,
     /// The available agent profiles.
     pub profiles: Option<IndexMap<Arc<str>, AgentProfileContent>>,
+    /// Token prices used by the agent usage dashboard, keyed by model id
+    /// (for example `claude-opus-5`).
+    ///
+    /// An entry here always wins over a price reported by the model's
+    /// provider. Models with neither are listed with their token counts and
+    /// no cost, rather than being counted as free.
+    ///
+    /// Default: {}
+    pub model_pricing: Option<IndexMap<Arc<str>, ModelPricing>>,
     /// Where to show a popup notification when the agent is waiting for user input.
     ///
     /// Default: "primary_screen"
@@ -604,6 +613,24 @@ pub struct LanguageModelSelection {
     pub enable_thinking: bool,
     pub effort: Option<String>,
     pub speed: Option<language_model_core::Speed>,
+}
+
+/// What one model charges, in US dollars per million tokens.
+///
+/// Rates are per-token prices rather than a single blended number because
+/// cached and uncached input are billed very differently; collapsing them
+/// would misreport any agent that relies on prompt caching.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct ModelPricing {
+    /// Price per million input tokens that were not served from cache.
+    pub input: f32,
+    /// Price per million output tokens.
+    pub output: f32,
+    /// Price per million input tokens served from cache. Defaults to `input`.
+    pub cache_read: Option<f32>,
+    /// Price per million tokens written to the cache. Defaults to `input`.
+    pub cache_write: Option<f32>,
 }
 
 #[with_fallible_options]

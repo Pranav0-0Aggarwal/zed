@@ -36,6 +36,7 @@ pub mod thread_worktree_archive;
 pub mod threads_archive_view;
 mod ui;
 mod unicode_confusables;
+pub mod usage_dashboard;
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -247,6 +248,8 @@ actions!(
         FocusRight,
         /// Opens the active thread as a markdown file.
         OpenActiveThreadAsMarkdown,
+        /// Opens the agent usage dashboard, showing token spend per model.
+        OpenUsageDashboard,
         /// Opens the agent diff view to review changes.
         OpenAgentDiff,
         /// Copies the current thread to the clipboard as JSON for debugging.
@@ -616,6 +619,7 @@ pub fn init(
     agent_panel::init(cx);
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
+    usage_dashboard::init(cx);
     terminal_thread_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);

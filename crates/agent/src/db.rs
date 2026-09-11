@@ -6,7 +6,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, IndexMap};
 use futures::{FutureExt, future::Shared};
-use gpui::{BackgroundExecutor, Global, Task};
+use gpui::{AppContext as _, BackgroundExecutor, Global, Task};
 use indoc::indoc;
 use language_model::Speed;
 use parking_lot::Mutex;
@@ -18,6 +18,7 @@ use sqlez::{
 };
 use std::{io::ErrorKind, path::PathBuf, sync::Arc};
 use ui::{App, SharedString};
+use util::ResultExt as _;
 use util::path_list::PathList;
 use zed_env_vars::ZED_STATELESS;
 
@@ -35,6 +36,38 @@ pub struct DbThreadMetadata {
     /// The workspace folder paths this thread was created against, sorted
     /// lexicographically. Used for grouping threads by project in the sidebar.
     pub folder_paths: PathList,
+}
+
+/// Loads every thread's token usage, for cost reporting.
+///
+/// This is the whole data dependency of the agent usage dashboard, kept as a
+/// single entry point so [`ThreadsDatabase`] itself stays crate-private. Rows
+/// saved before the usage columns existed are filled in first, so the numbers
+/// cover all of history and not just threads touched since the upgrade.
+pub fn thread_usage(cx: &mut App) -> Task<Result<Vec<ThreadUsageRow>>> {
+    let database = ThreadsDatabase::connect(cx);
+
+    cx.background_spawn(async move {
+        let database = database
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to open thread database: {err}"))?;
+        database.backfill_usage_columns().await?;
+        database.thread_usage().await
+    })
+}
+
+/// One thread's cumulative token usage, read straight from the denormalized
+/// columns on the `threads` row.
+///
+/// Threads written before those columns existed are omitted by
+/// [`ThreadsDatabase::thread_usage`] until the backfill reaches them, rather
+/// than being reported as zero-cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadUsageRow {
+    pub updated_at: DateTime<Utc>,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    pub usage: language_model::TokenUsage,
 }
 
 impl From<&DbThreadMetadata> for acp_thread::AgentSessionInfo {
@@ -484,6 +517,23 @@ impl ThreadsDatabase {
             }
         }
 
+        // Denormalized copies of each thread's cumulative token usage and model,
+        // so cost reporting can aggregate in SQL. The authoritative values still
+        // live in the compressed `data` blob; these columns exist only so the
+        // usage dashboard never has to decompress every thread to add up tokens.
+        // NULL means "not yet backfilled" and is distinct from a genuine zero.
+        if let Ok(mut s) = connection.exec(indoc! {"
+            ALTER TABLE threads ADD COLUMN input_tokens INTEGER;
+            ALTER TABLE threads ADD COLUMN output_tokens INTEGER;
+            ALTER TABLE threads ADD COLUMN cache_read_tokens INTEGER;
+            ALTER TABLE threads ADD COLUMN cache_creation_tokens INTEGER;
+            ALTER TABLE threads ADD COLUMN model_id TEXT;
+            ALTER TABLE threads ADD COLUMN provider_id TEXT;
+        "})
+        {
+            s().ok();
+        }
+
         let db = Self {
             executor,
             connection: Arc::new(Mutex::new(connection)),
@@ -511,6 +561,12 @@ impl ThreadsDatabase {
 
         let title = thread.title.to_string();
         let updated_at = thread.updated_at.to_rfc3339();
+        // Read before `thread` is moved into the serialized payload below.
+        let usage = thread.cumulative_token_usage;
+        let (provider_id, model_id) = match thread.model.as_ref() {
+            Some(model) => (Some(model.provider.clone()), Some(model.model.clone())),
+            None => (None, None),
+        };
         let parent_id = thread
             .subagent_context
             .as_ref()
@@ -541,9 +597,22 @@ impl ThreadsDatabase {
         // created, not when it was saved to the database.
         let created_at = updated_at.clone();
 
-        let mut insert = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, String, String, DataType, Vec<u8>, String)>(indoc! {"
-            INSERT INTO threads (id, parent_id, folder_paths, folder_paths_order, summary, updated_at, data_type, data, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        type ThreadRow = (
+            Arc<str>,
+            Option<Arc<str>>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            DataType,
+            Vec<u8>,
+            String,
+        );
+        type UsageRow = (i64, i64, i64, i64, Option<String>, Option<String>);
+
+        let mut insert = connection.exec_bound::<(ThreadRow, UsageRow)>(indoc! {"
+            INSERT INTO threads (id, parent_id, folder_paths, folder_paths_order, summary, updated_at, data_type, data, created_at, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model_id, provider_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             ON CONFLICT(id) DO UPDATE SET
                 parent_id = excluded.parent_id,
                 folder_paths = excluded.folder_paths,
@@ -551,19 +620,35 @@ impl ThreadsDatabase {
                 summary = excluded.summary,
                 updated_at = excluded.updated_at,
                 data_type = excluded.data_type,
-                data = excluded.data
+                data = excluded.data,
+                input_tokens = excluded.input_tokens,
+                output_tokens = excluded.output_tokens,
+                cache_read_tokens = excluded.cache_read_tokens,
+                cache_creation_tokens = excluded.cache_creation_tokens,
+                model_id = excluded.model_id,
+                provider_id = excluded.provider_id
         "})?;
 
         insert((
-            id.0,
-            parent_id,
-            folder_paths_str,
-            folder_paths_order_str,
-            title,
-            updated_at,
-            data_type,
-            data,
-            created_at,
+            (
+                id.0,
+                parent_id,
+                folder_paths_str,
+                folder_paths_order_str,
+                title,
+                updated_at,
+                data_type,
+                data,
+                created_at,
+            ),
+            (
+                usage.input_tokens as i64,
+                usage.output_tokens as i64,
+                usage.cache_read_input_tokens as i64,
+                usage.cache_creation_input_tokens as i64,
+                model_id,
+                provider_id,
+            ),
         ))?;
 
         Ok(())
@@ -627,6 +712,133 @@ impl ThreadsDatabase {
             } else {
                 Ok(None)
             }
+        })
+    }
+
+    /// Every thread's cumulative token usage, for cost reporting.
+    ///
+    /// Touches only the denormalized integer columns, so the cost of this query
+    /// is a function of the thread *count*, not of transcript size: no blob is
+    /// decompressed and no JSON is parsed. Bucketing and pricing are left to
+    /// the caller so this stays a single round trip.
+    pub fn thread_usage(&self) -> Task<Result<Vec<ThreadUsageRow>>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+
+            let mut select = connection
+                .select_bound::<(), (String, Option<String>, Option<String>, i64, i64, i64, i64)>(indoc! {"
+                SELECT updated_at, provider_id, model_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+                FROM threads
+                WHERE input_tokens IS NOT NULL
+            "})?;
+
+            select(())?
+                .into_iter()
+                .map(|(updated_at, provider_id, model_id, input, output, cache_read, cache_creation)| {
+                    Ok(ThreadUsageRow {
+                        updated_at: DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc),
+                        provider_id,
+                        model_id,
+                        // Counts are written from `u64`s; clamp rather than wrap
+                        // if a row was ever hand-edited to a negative value.
+                        usage: language_model::TokenUsage {
+                            input_tokens: input.max(0) as u64,
+                            output_tokens: output.max(0) as u64,
+                            cache_read_input_tokens: cache_read.max(0) as u64,
+                            cache_creation_input_tokens: cache_creation.max(0) as u64,
+                        },
+                    })
+                })
+                .collect()
+        })
+    }
+
+    /// Populates the usage columns for threads saved before those columns
+    /// existed.
+    ///
+    /// This is the only code path that decompresses blobs for usage, and it
+    /// does so once per thread: writing the columns is what takes a row out of
+    /// the `IS NULL` set, so later runs skip it. Work happens in bounded
+    /// batches, each its own lock acquisition, so a long history never blocks
+    /// thread saves for more than one batch. Returns the number of rows filled.
+    pub fn backfill_usage_columns(&self) -> Task<Result<usize>> {
+        const BATCH: usize = 64;
+
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            let mut filled = 0;
+
+            loop {
+                let batch = {
+                    let connection = connection.lock();
+                    let mut select = connection
+                        .select_bound::<usize, (Arc<str>, DataType, Vec<u8>)>(indoc! {"
+                        SELECT id, data_type, data FROM threads WHERE input_tokens IS NULL LIMIT ?
+                    "})?;
+                    select(BATCH)?
+                };
+
+                if batch.is_empty() {
+                    break;
+                }
+
+                let decoded = batch
+                    .into_iter()
+                    .map(|(id, data_type, data)| {
+                        // A row we cannot decode is still claimed, with zeroed
+                        // counts, so it cannot spin this loop forever. It shows
+                        // up as a thread with no recorded usage, which is what
+                        // an unreadable transcript honestly is.
+                        let usage = Self::deserialize_thread(data_type, data)
+                            .log_err()
+                            .map(|thread| {
+                                let model = thread.model;
+                                (
+                                    thread.cumulative_token_usage,
+                                    model.as_ref().map(|model| model.provider.clone()),
+                                    model.as_ref().map(|model| model.model.clone()),
+                                )
+                            })
+                            .unwrap_or_default();
+                        (id, usage)
+                    })
+                    .collect::<Vec<_>>();
+
+                {
+                    let connection = connection.lock();
+                    let mut update = connection.exec_bound::<(
+                        (i64, i64, i64, i64),
+                        (Option<String>, Option<String>, Arc<str>),
+                    )>(indoc! {"
+                        UPDATE threads SET
+                            input_tokens = ?1,
+                            output_tokens = ?2,
+                            cache_read_tokens = ?3,
+                            cache_creation_tokens = ?4,
+                            provider_id = ?5,
+                            model_id = ?6
+                        WHERE id = ?7
+                    "})?;
+
+                    for (id, (usage, provider_id, model_id)) in decoded {
+                        update((
+                            (
+                                usage.input_tokens as i64,
+                                usage.output_tokens as i64,
+                                usage.cache_read_input_tokens as i64,
+                                usage.cache_creation_input_tokens as i64,
+                            ),
+                            (provider_id, model_id, id),
+                        ))?;
+                        filled += 1;
+                    }
+                }
+            }
+
+            Ok(filled)
         })
     }
 

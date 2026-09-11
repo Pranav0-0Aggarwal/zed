@@ -577,6 +577,8 @@ mod tests {
             max_content_width: Some(px(850.)),
             default_model: None,
             subagent_model: None,
+            fetch_model_prices: false,
+            model_pricing: Default::default(),
             inline_assistant_model: None,
             inline_assistant_use_streaming_tools: false,
             commit_message_model: None,

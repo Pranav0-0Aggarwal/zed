@@ -157,6 +157,13 @@ struct Summary {
 ///
 /// Pure, and linear in the number of threads: the whole reason the range
 /// buttons need no second query.
+///
+/// A thread is attributed entirely to the day it was last active, because
+/// that is the granularity the denormalized columns record. Per-model totals
+/// are therefore exact, but a thread worked on across a range boundary counts
+/// wholly on its last day. Splitting spend by day properly would mean reading
+/// per-message usage out of the compressed blobs, which is the cost this whole
+/// design exists to avoid.
 fn summarize(
     rows: &[ThreadUsageRow],
     since: Option<NaiveDate>,
@@ -368,7 +375,15 @@ impl Render for UsageDashboard {
             .child(
                 h_flex()
                     .justify_between()
-                    .child(Headline::new("Agent Usage").size(HeadlineSize::Medium))
+                    .child(
+                        v_flex()
+                            .child(Headline::new("Agent Usage").size(HeadlineSize::Medium))
+                            .child(
+                                Label::new("Grouped by each thread's last activity")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
                     .child(h_flex().gap_1().children(Range::ALL.map(|option| {
                         Button::new(option.label(), option.label())
                             .toggle_state(option == range)
